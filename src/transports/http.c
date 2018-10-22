@@ -87,6 +87,7 @@ typedef struct {
 	char parse_buffer_data[NETIO_BUFSIZE];
 	char *content_type;
 	char *location;
+	git_vector proxy_authenticate;
 	git_vector www_authenticate;
 	enum last_cb last_cb;
 	int parse_error;
@@ -288,6 +289,12 @@ static int on_header_ready(http_subtransport *t)
 			GITERR_CHECK_ALLOC(t->content_type);
 		}
 	}
+	else if (!strcasecmp("Proxy-Authenticate", git_buf_cstr(name))) {
+		char *dup = git__strdup(git_buf_cstr(value));
+		GITERR_CHECK_ALLOC(dup);
+
+		git_vector_insert(&t->proxy_authenticate, dup);
+	}
 	else if (!strcasecmp("WWW-Authenticate", git_buf_cstr(name))) {
 		char *dup = git__strdup(git_buf_cstr(value));
 		GITERR_CHECK_ALLOC(dup);
@@ -342,32 +349,35 @@ static int on_header_value(http_parser *parser, const char *str, size_t len)
 	return 0;
 }
 
-static int on_auth_required(http_parser *parser, int allowed_types)
+static int on_auth_required(
+	git_cred **creds,
+	http_parser *parser,
+	const char *url,
+	git_cred_acquire_cb callback,
+	void *callback_payload,
+	const char *username,
+	int allowed_types)
 {
 	parser_context *ctx = (parser_context *) parser->data;
 	http_subtransport *t = ctx->t;
 	int ret;
+
+	if (!callback) {
+		giterr_set(GITERR_NET, "authentication required but no credential provider configured");
+		return t->parse_error = PARSE_ERROR_GENERIC;
+	}
 
 	if (!allowed_types) {
 		giterr_set(GITERR_NET, "remote did not prompt for authentication mechanisms");
 		return t->parse_error = PARSE_ERROR_GENERIC;
 	}
 
-	if (!t->owner->cred_acquire_cb) {
-		giterr_set(GITERR_NET, "authentication required but no credential provider configured");
-		return t->parse_error = PARSE_ERROR_GENERIC;
+	if (*creds) {
+		(*creds)->free(*creds);
+		*creds = NULL;
 	}
 
-	if (t->cred) {
-		t->cred->free(t->cred);
-		t->cred = NULL;
-	}
-
-	ret = t->owner->cred_acquire_cb(&t->cred,
-			  t->owner->url,
-			  t->gitserver_data.user,
-			  allowed_types,
-			  t->owner->cred_acquire_payload);
+	ret = callback(creds, url, username, allowed_types, callback_payload);
 
 	if (ret == GIT_PASSTHROUGH) {
 		giterr_set(GITERR_NET, "authentication required but credential provider did not provide credentials");
@@ -377,9 +387,9 @@ static int on_auth_required(http_parser *parser, int allowed_types)
 		return t->parse_error = PARSE_ERROR_EXT;
 	}
 
-	assert(t->cred);
+	assert(*creds);
 
-	if (!(t->cred->credtype & allowed_types)) {
+	if (!((*creds)->credtype & allowed_types)) {
 		giterr_set(GITERR_NET, "credential provider returned an invalid cred type");
 		return t->parse_error = PARSE_ERROR_GENERIC;
 	}
@@ -414,7 +424,13 @@ static int on_headers_complete(http_parser *parser)
 
 	/* Check for an authentication failure. */
 	if (parser->status_code == 401 && get_verb == s->verb)
-		return on_auth_required(parser, allowed_www_auth_types);
+		return on_auth_required(&t->cred,
+		    parser,
+		    t->owner->url,
+		    t->owner->cred_acquire_cb,
+		    t->owner->cred_acquire_payload,
+		    t->gitserver_data.user,
+		    allowed_www_auth_types);
 
 	/* Check for a redirect.
 	 * Right now we only permit a redirect to the same hostname. */
@@ -547,6 +563,7 @@ static void clear_parser_state(http_subtransport *t)
 	git__free(t->location);
 	t->location = NULL;
 
+	git_vector_free_deep(&t->proxy_authenticate);
 	git_vector_free_deep(&t->www_authenticate);
 }
 
@@ -643,6 +660,12 @@ static int http_connect(http_subtransport *t)
 
 	connection_data = (t->proxy.type == GIT_PROXY_SPECIFIED) ?
 		&t->proxy_data : &t->gitserver_data;
+
+	/* HERE */
+	printf("%s PROXY\n", (connection_data == &t->proxy_data) ? "YO" : "NO");
+	printf("t->proxy_data.host = %s\n", connection_data->host);
+	printf("t->proxy_data.port = %s\n", connection_data->port);
+	printf("t->proxy_data.path = %s\n", connection_data->path);
 
 #ifdef GIT_CURL
 	error = git_curl_stream_new(&t->gitserver_stream,
@@ -1069,6 +1092,17 @@ static int http_action(
 
 	if ((ret = load_proxy_config(t)) < 0)
 		return ret;
+
+	/* HERE */
+
+	printf("url: %s\n", url);
+	printf("t->gitserver_data.host = %s\n", t->gitserver_data.host);
+	printf("t->gitserver_data.port = %s\n", t->gitserver_data.port);
+	printf("t->gitserver_data.path = %s\n", t->gitserver_data.path);
+
+	printf("t->proxy_data.host = %s\n", t->proxy_data.host);
+	printf("t->proxy_data.port = %s\n", t->proxy_data.port);
+	printf("t->proxy_data.path = %s\n", t->proxy_data.path);
 
 	if ((ret = http_connect(t)) < 0)
 		return ret;
