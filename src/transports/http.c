@@ -67,16 +67,27 @@ typedef struct {
 } http_stream;
 
 typedef struct {
+	gitno_connection_data url;
+	git_stream *stream;
+
+	git_cred *cred;
+	git_cred *url_cred;
+
+	git_vector auth_challenges;
+	git_vector auth_contexts;
+} http_server;
+
+typedef struct {
 	git_smart_subtransport parent;
 	transport_smart *owner;
 	git_stream *gitserver_stream;
-	gitno_connection_data gitserver_data;
 	bool connected;
 
-	/* Proxy */
-	git_proxy_options proxy;
+	http_server server;
+
+	http_server proxy;
 	char *proxy_url;
-	gitno_connection_data proxy_data;
+	git_proxy_options proxy_opts;
 
 	/* Parser structures */
 	http_parser parser;
@@ -87,18 +98,10 @@ typedef struct {
 	char parse_buffer_data[NETIO_BUFSIZE];
 	char *content_type;
 	char *location;
-	git_vector proxy_authenticate;
-	git_vector www_authenticate;
 	enum last_cb last_cb;
 	int parse_error;
 	int error;
 	unsigned parse_finished : 1;
-
-	/* Authentication */
-	git_cred *cred;
-	git_cred *url_cred;
-	git_cred *proxy_cred;
-	git_vector auth_contexts;
 } http_subtransport;
 
 typedef struct {
@@ -131,7 +134,7 @@ static bool challenge_match(git_http_auth_scheme *scheme, void *data)
 
 static int auth_context_match(
 	git_http_auth_context **out,
-	http_subtransport *t,
+	http_server *server,
 	bool (*scheme_match)(git_http_auth_scheme *scheme, void *data),
 	void *data)
 {
@@ -152,7 +155,7 @@ static int auth_context_match(
 		return 0;
 
 	/* See if authentication has already started for this scheme */
-	git_vector_foreach(&t->auth_contexts, i, c) {
+	git_vector_foreach(&server->auth_contexts, i, c) {
 		if (c->type == scheme->type) {
 			context = c;
 			break;
@@ -160,11 +163,11 @@ static int auth_context_match(
 	}
 
 	if (!context) {
-		if (scheme->init_context(&context, &t->gitserver_data) < 0)
+		if (scheme->init_context(&context, &server->url) < 0)
 			return -1;
 		else if (!context)
 			return 0;
-		else if (git_vector_insert(&t->auth_contexts, context) < 0)
+		else if (git_vector_insert(&server->auth_contexts, context) < 0)
 			return -1;
 	}
 
@@ -173,26 +176,27 @@ static int auth_context_match(
 	return 0;
 }
 
-static int apply_credentials(git_buf *buf, http_subtransport *t)
+static int apply_credentials(git_buf *buf, http_server *server)
 {
-	git_cred *cred = t->cred;
+	git_cred *cred = server->cred;
 	git_http_auth_context *context;
 
 	/* Apply the credentials given to us in the URL */
-	if (!cred && t->gitserver_data.user && t->gitserver_data.pass) {
-		if (!t->url_cred &&
-			git_cred_userpass_plaintext_new(&t->url_cred,
-				t->gitserver_data.user, t->gitserver_data.pass) < 0)
+	if (!cred && server->url.user && server->url.pass) {
+		if (!server->url_cred &&
+			git_cred_userpass_plaintext_new(&server->url_cred,
+			    server->url.user, server->url.pass) < 0)
 			return -1;
 
-		cred = t->url_cred;
+		cred = server->url_cred;
 	}
 
 	if (!cred)
 		return 0;
 
 	/* Get or create a context for the best scheme for this cred type */
-	if (auth_context_match(&context, t, credtype_match, &cred->credtype) < 0)
+	if (auth_context_match(&context, server,
+	    credtype_match, &cred->credtype) < 0)
 		return -1;
 
 	if (!context)
@@ -207,15 +211,15 @@ static int gen_request(
 	size_t content_length)
 {
 	http_subtransport *t = OWNING_SUBTRANSPORT(s);
-	const char *path = t->gitserver_data.path ? t->gitserver_data.path : "/";
+	const char *path = t->server.url.path ? t->server.url.path : "/";
 	size_t i;
 
-	if (t->proxy.type == GIT_PROXY_SPECIFIED)
+	if (t->proxy_opts.type == GIT_PROXY_SPECIFIED)
 		git_buf_printf(buf, "%s %s://%s:%s%s%s HTTP/1.1\r\n",
 			s->verb,
-			t->gitserver_data.use_ssl ? "https" : "http",
-			t->gitserver_data.host,
-			t->gitserver_data.port,
+			t->server.url.use_ssl ? "https" : "http",
+			t->server.url.host,
+			t->server.url.port,
 			path, s->service_url);
 	else
 		git_buf_printf(buf, "%s %s%s HTTP/1.1\r\n",
@@ -224,7 +228,7 @@ static int gen_request(
 	git_buf_puts(buf, "User-Agent: ");
 	git_http__user_agent(buf);
 	git_buf_puts(buf, "\r\n");
-	git_buf_printf(buf, "Host: %s\r\n", t->gitserver_data.host);
+	git_buf_printf(buf, "Host: %s\r\n", t->server.url.host);
 
 	if (s->chunked || content_length > 0) {
 		git_buf_printf(buf, "Accept: application/x-git-%s-result\r\n", s->service);
@@ -243,7 +247,7 @@ static int gen_request(
 	}
 
 	/* Apply credentials to the request */
-	if (apply_credentials(buf, t) < 0)
+	if (apply_credentials(buf, &t->server) < 0)
 		return -1;
 
 	git_buf_puts(buf, "\r\n");
@@ -255,16 +259,16 @@ static int gen_request(
 }
 
 static int parse_authenticate_response(
-	git_vector *www_authenticate,
-	http_subtransport *t,
+	http_server *server,
 	int *allowed_types)
 {
 	git_http_auth_context *context;
 	char *challenge;
 	size_t i;
 
-	git_vector_foreach(www_authenticate, i, challenge) {
-		if (auth_context_match(&context, t, challenge_match, challenge) < 0)
+	git_vector_foreach(&server->auth_challenges, i, challenge) {
+		if (auth_context_match(&context, server,
+		    challenge_match, challenge) < 0)
 			return -1;
 		else if (!context)
 			continue;
@@ -294,13 +298,13 @@ static int on_header_ready(http_subtransport *t)
 		char *dup = git__strdup(git_buf_cstr(value));
 		GITERR_CHECK_ALLOC(dup);
 
-		git_vector_insert(&t->proxy_authenticate, dup);
+		git_vector_insert(&t->proxy.auth_challenges, dup);
 	}
 	else if (!strcasecmp("WWW-Authenticate", git_buf_cstr(name))) {
 		char *dup = git__strdup(git_buf_cstr(value));
 		GITERR_CHECK_ALLOC(dup);
 
-		git_vector_insert(&t->www_authenticate, dup);
+		git_vector_insert(&t->server.auth_challenges, dup);
 	}
 	else if (!strcasecmp("Location", git_buf_cstr(name))) {
 		if (!t->location) {
@@ -411,7 +415,7 @@ static int on_headers_complete(http_parser *parser)
 	http_subtransport *t = ctx->t;
 	http_stream *s = ctx->s;
 	git_buf buf = GIT_BUF_INIT;
-	int allowed_proxy_auth_types = 0, allowed_www_auth_types = 0;
+	int proxy_auth_types = 0, server_auth_types = 0;
 
 	/* Enforce a reasonable cap on the number of replays */
 	if (++s->replay_count >= GIT_HTTP_REPLAY_MAX) {
@@ -430,33 +434,31 @@ static int on_headers_complete(http_parser *parser)
 	 * these may be 407/401 (authentication is not complete) or a 200
 	 * (informing us that auth has completed).
 	 */
-	if (parse_authenticate_response(&t->proxy_authenticate, t,
-	        &allowed_proxy_auth_types) < 0 ||
-	    parse_authenticate_response(&t->www_authenticate, t,
-	        &allowed_www_auth_types) < 0)
+	if (parse_authenticate_response(&t->proxy, &proxy_auth_types) < 0 ||
+	    parse_authenticate_response(&t->server, &server_auth_types) < 0)
 		return t->parse_error = PARSE_ERROR_GENERIC;
 
 	/* Check for a proxy authentication failure. */
 	if (parser->status_code == 407 && get_verb == s->verb)
-		return on_auth_required(&t->proxy_cred,
+		return on_auth_required(&t->proxy.cred,
 		    parser,
-		    t->proxy.url,
+		    t->proxy_opts.url,
 		    "proxy",
-		    t->proxy.credentials,
-		    t->proxy.payload,
-		    t->proxy_data.user,
-			allowed_proxy_auth_types);
+		    t->proxy_opts.credentials,
+		    t->proxy_opts.payload,
+		    t->proxy.url.user,
+			proxy_auth_types);
 
 	/* Check for an authentication failure. */
 	if (parser->status_code == 401 && get_verb == s->verb)
-		return on_auth_required(&t->cred,
+		return on_auth_required(&t->server.cred,
 		    parser,
 		    t->owner->url,
 		    "remote",
 		    t->owner->cred_acquire_cb,
 		    t->owner->cred_acquire_payload,
-		    t->gitserver_data.user,
-		    allowed_www_auth_types);
+		    t->server.url.user,
+		    server_auth_types);
 
 	/* Check for a redirect.
 	 * Right now we only permit a redirect to the same hostname. */
@@ -467,7 +469,7 @@ static int on_headers_complete(http_parser *parser)
 	     parser->status_code == 308) &&
 	    t->location) {
 
-		if (gitno_connection_data_from_url(&t->gitserver_data, t->location, s->service_url) < 0)
+		if (gitno_connection_data_from_url(&t->server.url, t->location, s->service_url) < 0)
 			return t->parse_error = PARSE_ERROR_GENERIC;
 
 		/* Set the redirect URL on the stream. This is a transfer of
@@ -561,7 +563,7 @@ static int on_body_fill_buffer(http_parser *parser, const char *str, size_t len)
 static void clear_parser_state(http_subtransport *t)
 {
 	http_parser_init(&t->parser, HTTP_RESPONSE);
-	gitno_buffer_setup_fromstream(t->gitserver_stream,
+	gitno_buffer_setup_fromstream(t->server.stream,
 		&t->parse_buffer,
 		t->parse_buffer_data,
 		sizeof(t->parse_buffer_data));
@@ -582,8 +584,8 @@ static void clear_parser_state(http_subtransport *t)
 	git__free(t->location);
 	t->location = NULL;
 
-	git_vector_free_deep(&t->proxy_authenticate);
-	git_vector_free_deep(&t->www_authenticate);
+	git_vector_free_deep(&t->proxy.auth_challenges);
+	git_vector_free_deep(&t->server.auth_challenges);
 }
 
 static int write_chunk(git_stream *io, const char *buffer, size_t len)
@@ -617,11 +619,11 @@ static int write_chunk(git_stream *io, const char *buffer, size_t len)
 static int apply_proxy_config_to_stream(http_subtransport *t)
 {
 	/* Only set the proxy configuration on the curl stream. */
-	if (!git_stream_supports_proxy(t->gitserver_stream) ||
-	    t->proxy.type == GIT_PROXY_NONE)
+	if (!git_stream_supports_proxy(t->server.stream) ||
+	    t->proxy_opts.type == GIT_PROXY_NONE)
 		return 0;
 
-	return git_stream_set_proxy(t->gitserver_stream, &t->proxy);
+	return git_stream_set_proxy(t->server.stream, &t->proxy_opts);
 }
 
 static int load_proxy_config(http_subtransport *t)
@@ -636,33 +638,33 @@ static int load_proxy_config(http_subtransport *t)
 		git__free(t->proxy_url);
 		t->proxy_url = NULL;
 
-		git_proxy_init_options(&t->proxy, GIT_PROXY_OPTIONS_VERSION);
+		git_proxy_init_options(&t->proxy_opts, GIT_PROXY_OPTIONS_VERSION);
 
 		if ((error = git_remote__get_http_proxy(t->owner->owner,
-		    !!t->gitserver_data.use_ssl, &t->proxy_url)) < 0)
+		    !!t->server.url.use_ssl, &t->proxy_url)) < 0)
 			return error;
 
-		t->proxy.type = GIT_PROXY_SPECIFIED;
-		t->proxy.url = t->proxy_url;
-		t->proxy.credentials = t->owner->proxy.credentials;
-		t->proxy.certificate_check = t->owner->proxy.certificate_check;
-		t->proxy.payload = t->owner->proxy.payload;
+		t->proxy_opts.type = GIT_PROXY_SPECIFIED;
+		t->proxy_opts.url = t->proxy_url;
+		t->proxy_opts.credentials = t->owner->proxy.credentials;
+		t->proxy_opts.certificate_check = t->owner->proxy.certificate_check;
+		t->proxy_opts.payload = t->owner->proxy.payload;
 		break;
 
 	case GIT_PROXY_SPECIFIED:
-		memcpy(&t->proxy, &t->owner->proxy, sizeof(git_proxy_options));
+		memcpy(&t->proxy_opts, &t->owner->proxy, sizeof(git_proxy_options));
 		break;
 
 	default:
 		abort();
 	}
 
-	return gitno_connection_data_from_url(&t->proxy_data, t->proxy.url, NULL);
+	return gitno_connection_data_from_url(&t->proxy.url, t->proxy_opts.url, NULL);
 }
 
 static int http_connect(http_subtransport *t)
 {
-	gitno_connection_data *connection_data;
+	gitno_connection_data *connection_url;
 	int error;
 
 	if (t->connected &&
@@ -670,54 +672,48 @@ static int http_connect(http_subtransport *t)
 		t->parse_finished)
 		return 0;
 
-	if (t->gitserver_stream) {
-		git_stream_close(t->gitserver_stream);
-		git_stream_free(t->gitserver_stream);
-		t->gitserver_stream = NULL;
+	if (t->server.stream) {
+		git_stream_close(t->server.stream);
+		git_stream_free(t->server.stream);
+		t->server.stream = NULL;
 		t->connected = 0;
 	}
 
-	connection_data = (t->proxy.type == GIT_PROXY_SPECIFIED) ?
-		&t->proxy_data : &t->gitserver_data;
-
-	/* HERE */
-	printf("%s PROXY\n", (connection_data == &t->proxy_data) ? "YO" : "NO");
-	printf("t->proxy_data.host = %s\n", connection_data->host);
-	printf("t->proxy_data.port = %s\n", connection_data->port);
-	printf("t->proxy_data.path = %s\n", connection_data->path);
+	connection_url = (t->proxy_opts.type == GIT_PROXY_SPECIFIED) ?
+		&t->proxy.url : &t->server.url;
 
 #ifdef GIT_CURL
-	error = git_curl_stream_new(&t->gitserver_stream,
-	    t->gitserver_data.host, t->gitserver_data.port);
+	error = git_curl_stream_new(&t->server.stream,
+	    t->server.url.host, t->server.url.port);
 #else
-	if (connection_data->use_ssl)
-		error = git_tls_stream_new(&t->gitserver_stream,
-		    connection_data->host, connection_data->port);
+	if (connection_url->use_ssl)
+		error = git_tls_stream_new(&t->server.stream,
+		    connection_url->host, connection_url->port);
 	else
-		error = git_socket_stream_new(&t->gitserver_stream,
-		    connection_data->host, connection_data->port);
+		error = git_socket_stream_new(&t->server.stream,
+		    connection_url->host, connection_url->port);
 #endif
 
 	if (error < 0)
 		return error;
 
-	GITERR_CHECK_VERSION(t->gitserver_stream, GIT_STREAM_VERSION, "git_stream");
+	GITERR_CHECK_VERSION(t->server.stream, GIT_STREAM_VERSION, "git_stream");
 
 	if ((error = apply_proxy_config_to_stream(t)) < 0)
 		return error;
 
-	error = git_stream_connect(t->gitserver_stream);
+	error = git_stream_connect(t->server.stream);
 
 	if ((!error || error == GIT_ECERTIFICATE) && t->owner->certificate_check_cb != NULL &&
-	    git_stream_is_encrypted(t->gitserver_stream)) {
+	    git_stream_is_encrypted(t->server.stream)) {
 		git_cert *cert;
 		int is_valid = (error == GIT_OK);
 
-		if ((error = git_stream_certificate(&cert, t->gitserver_stream)) < 0)
+		if ((error = git_stream_certificate(&cert, t->server.stream)) < 0)
 			return error;
 
 		giterr_clear();
-		error = t->owner->certificate_check_cb(cert, is_valid, t->gitserver_data.host, t->owner->message_cb_payload);
+		error = t->owner->certificate_check_cb(cert, is_valid, t->server.url.host, t->owner->message_cb_payload);
 
 		if (error < 0) {
 			if (!giterr_last())
@@ -758,7 +754,7 @@ replay:
 		if (gen_request(&request, s, 0) < 0)
 			return -1;
 
-		if (git_stream_write(t->gitserver_stream,
+		if (git_stream_write(t->server.stream,
 		    request.ptr, request.size, 0) < 0) {
 			git_buf_dispose(&request);
 			return -1;
@@ -775,14 +771,14 @@ replay:
 
 			/* Flush, if necessary */
 			if (s->chunk_buffer_len > 0 &&
-				write_chunk(t->gitserver_stream,
+				write_chunk(t->server.stream,
 				    s->chunk_buffer, s->chunk_buffer_len) < 0)
 				return -1;
 
 			s->chunk_buffer_len = 0;
 
 			/* Write the final chunk. */
-			if (git_stream_write(t->gitserver_stream, "0\r\n\r\n", 5, 0) < 0)
+			if (git_stream_write(t->server.stream, "0\r\n\r\n", 5, 0) < 0)
 				return -1;
 		}
 
@@ -881,7 +877,7 @@ static int http_stream_write_chunked(
 		if (gen_request(&request, s, 0) < 0)
 			return -1;
 
-		if (git_stream_write(t->gitserver_stream,
+		if (git_stream_write(t->server.stream,
 		    request.ptr, request.size, 0) < 0) {
 			git_buf_dispose(&request);
 			return -1;
@@ -895,7 +891,7 @@ static int http_stream_write_chunked(
 	if (len > CHUNK_SIZE) {
 		/* Flush, if necessary */
 		if (s->chunk_buffer_len > 0) {
-			if (write_chunk(t->gitserver_stream,
+			if (write_chunk(t->server.stream,
 			    s->chunk_buffer, s->chunk_buffer_len) < 0)
 				return -1;
 
@@ -903,7 +899,7 @@ static int http_stream_write_chunked(
 		}
 
 		/* Write chunk directly */
-		if (write_chunk(t->gitserver_stream, buffer, len) < 0)
+		if (write_chunk(t->server.stream, buffer, len) < 0)
 			return -1;
 	}
 	else {
@@ -920,7 +916,7 @@ static int http_stream_write_chunked(
 
 		/* Is the buffer full? If so, then flush */
 		if (CHUNK_SIZE == s->chunk_buffer_len) {
-			if (write_chunk(t->gitserver_stream,
+			if (write_chunk(t->server.stream,
 			    s->chunk_buffer, s->chunk_buffer_len) < 0)
 				return -1;
 
@@ -957,11 +953,11 @@ static int http_stream_write_single(
 	if (gen_request(&request, s, len) < 0)
 		return -1;
 
-	if (git_stream_write(t->gitserver_stream,
+	if (git_stream_write(t->server.stream,
 	    request.ptr, request.size, 0) < 0)
 		goto on_error;
 
-	if (len && git_stream_write(t->gitserver_stream, buffer, len, 0) < 0)
+	if (len && git_stream_write(t->server.stream, buffer, len, 0) < 0)
 		goto on_error;
 
 	git_buf_dispose(&request);
@@ -1100,28 +1096,17 @@ static int http_action(
 	 * reuse the existing one.
 	 */
 	if (url) {
-		assert(!t->gitserver_data.host && !t->gitserver_data.port && !t->gitserver_data.path);
+		assert(!t->server.url.host && !t->server.url.port && !t->server.url.path);
 
-		if ((ret = gitno_connection_data_from_url(&t->gitserver_data, url, NULL)) < 0)
+		if ((ret = gitno_connection_data_from_url(&t->server.url, url, NULL)) < 0)
 			return ret;
 
 	}
 
-	assert(t->gitserver_data.host && t->gitserver_data.port && t->gitserver_data.path);
+	assert(t->server.url.host && t->server.url.port && t->server.url.path);
 
 	if ((ret = load_proxy_config(t)) < 0)
 		return ret;
-
-	/* HERE */
-
-	printf("url: %s\n", url);
-	printf("t->gitserver_data.host = %s\n", t->gitserver_data.host);
-	printf("t->gitserver_data.port = %s\n", t->gitserver_data.port);
-	printf("t->gitserver_data.path = %s\n", t->gitserver_data.path);
-
-	printf("t->proxy_data.host = %s\n", t->proxy_data.host);
-	printf("t->proxy_data.port = %s\n", t->proxy_data.port);
-	printf("t->proxy_data.path = %s\n", t->proxy_data.path);
 
 	if ((ret = http_connect(t)) < 0)
 		return ret;
@@ -1144,38 +1129,46 @@ static int http_action(
 	return -1;
 }
 
+static void free_auth_contexts(git_vector *contexts)
+{
+	git_http_auth_context *context;
+	size_t i;
+
+	git_vector_foreach(contexts, i, context) {
+		if (context->free)
+			context->free(context);
+	}
+
+	git_vector_clear(contexts);
+}
+
 static int http_close(git_smart_subtransport *subtransport)
 {
 	http_subtransport *t = (http_subtransport *) subtransport;
-	git_http_auth_context *context;
-	size_t i;
 
 	clear_parser_state(t);
 
 	t->connected = 0;
 
-	if (t->gitserver_stream) {
-		git_stream_close(t->gitserver_stream);
-		git_stream_free(t->gitserver_stream);
-		t->gitserver_stream = NULL;
+	if (t->server.stream) {
+		git_stream_close(t->server.stream);
+		git_stream_free(t->server.stream);
+		t->server.stream = NULL;
 	}
 
-	free_cred(&t->cred);
-	free_cred(&t->url_cred);
-	free_cred(&t->proxy_cred);
+	free_cred(&t->server.cred);
+	free_cred(&t->server.url_cred);
+	free_cred(&t->proxy.cred);
+	free_cred(&t->proxy.url_cred);
 
-	git_vector_foreach(&t->auth_contexts, i, context) {
-		if (context->free)
-			context->free(context);
-	}
+	free_auth_contexts(&t->server.auth_contexts);
+	free_auth_contexts(&t->proxy.auth_contexts);
 
-	git_vector_clear(&t->auth_contexts);
+	gitno_connection_data_free_ptrs(&t->server.url);
+	memset(&t->server.url, 0x0, sizeof(gitno_connection_data));
 
-	gitno_connection_data_free_ptrs(&t->gitserver_data);
-	memset(&t->gitserver_data, 0x0, sizeof(gitno_connection_data));
-
-	gitno_connection_data_free_ptrs(&t->proxy_data);
-	memset(&t->proxy_data, 0x0, sizeof(gitno_connection_data));
+	gitno_connection_data_free_ptrs(&t->proxy.url);
+	memset(&t->proxy.url, 0x0, sizeof(gitno_connection_data));
 
 	git__free(t->proxy_url);
 	t->proxy_url = NULL;
@@ -1189,7 +1182,8 @@ static void http_free(git_smart_subtransport *subtransport)
 
 	http_close(subtransport);
 
-	git_vector_free(&t->auth_contexts);
+	git_vector_free(&t->server.auth_contexts);
+	git_vector_free(&t->proxy.auth_contexts);
 	git__free(t);
 }
 
