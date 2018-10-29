@@ -20,6 +20,7 @@ static git_clone_options g_options;
 static char *_remote_url = NULL;
 static char *_remote_user = NULL;
 static char *_remote_pass = NULL;
+static char *_remote_sslnoverify = NULL;
 static char *_remote_ssh_pubkey = NULL;
 static char *_remote_ssh_privkey = NULL;
 static char *_remote_ssh_passphrase = NULL;
@@ -28,11 +29,23 @@ static char *_remote_proxy_scheme = NULL;
 static char *_remote_proxy_host = NULL;
 static char *_remote_proxy_user = NULL;
 static char *_remote_proxy_pass = NULL;
-static bool _remote_proxy_selfsigned = false;
+static char *_remote_proxy_selfsigned = NULL;
 
 static int _orig_proxies_need_reset = 0;
 static char *_orig_http_proxy = NULL;
 static char *_orig_https_proxy = NULL;
+
+static int ssl_cert(git_cert *cert, int valid, const char *host, void *payload)
+{
+	GIT_UNUSED(cert);
+	GIT_UNUSED(host);
+	GIT_UNUSED(payload);
+
+	if (_remote_sslnoverify != NULL)
+		valid = 1;
+
+	return valid ? 0 : GIT_ECERTIFICATE;
+}
 
 void test_online_clone__initialize(void)
 {
@@ -46,10 +59,12 @@ void test_online_clone__initialize(void)
 	g_options.checkout_opts = dummy_opts;
 	g_options.checkout_opts.checkout_strategy = GIT_CHECKOUT_SAFE;
 	g_options.fetch_opts = dummy_fetch;
+	g_options.fetch_opts.callbacks.certificate_check = ssl_cert;
 
 	_remote_url = cl_getenv("GITTEST_REMOTE_URL");
 	_remote_user = cl_getenv("GITTEST_REMOTE_USER");
 	_remote_pass = cl_getenv("GITTEST_REMOTE_PASS");
+	_remote_sslnoverify = cl_getenv("GITTEST_REMOTE_SSL_NOVERIFY");
 	_remote_ssh_pubkey = cl_getenv("GITTEST_REMOTE_SSH_PUBKEY");
 	_remote_ssh_privkey = cl_getenv("GITTEST_REMOTE_SSH_KEY");
 	_remote_ssh_passphrase = cl_getenv("GITTEST_REMOTE_SSH_PASSPHRASE");
@@ -58,7 +73,7 @@ void test_online_clone__initialize(void)
 	_remote_proxy_host = cl_getenv("GITTEST_REMOTE_PROXY_HOST");
 	_remote_proxy_user = cl_getenv("GITTEST_REMOTE_PROXY_USER");
 	_remote_proxy_pass = cl_getenv("GITTEST_REMOTE_PROXY_PASS");
-	_remote_proxy_selfsigned = cl_getenv("GITTEST_REMOTE_PROXY_SELFSIGNED") != NULL;
+	_remote_proxy_selfsigned = cl_getenv("GITTEST_REMOTE_PROXY_SELFSIGNED");
 
 	_orig_proxies_need_reset = 0;
 }
@@ -74,6 +89,7 @@ void test_online_clone__cleanup(void)
 	git__free(_remote_url);
 	git__free(_remote_user);
 	git__free(_remote_pass);
+	git__free(_remote_sslnoverify);
 	git__free(_remote_ssh_pubkey);
 	git__free(_remote_ssh_privkey);
 	git__free(_remote_ssh_passphrase);
@@ -82,6 +98,7 @@ void test_online_clone__cleanup(void)
 	git__free(_remote_proxy_host);
 	git__free(_remote_proxy_user);
 	git__free(_remote_proxy_pass);
+	git__free(_remote_proxy_selfsigned);
 
 	if (_orig_proxies_need_reset) {
 		cl_setenv("HTTP_PROXY", _orig_http_proxy);
@@ -482,6 +499,7 @@ void test_online_clone__ssh_auth_methods(void)
 #endif
 	g_options.fetch_opts.callbacks.credentials = check_ssh_auth_methods;
 	g_options.fetch_opts.callbacks.payload = &with_user;
+	g_options.fetch_opts.callbacks.certificate_check = NULL;
 
 	with_user = 0;
 	cl_git_fail_with(GIT_EUSER,
@@ -534,6 +552,7 @@ void test_online_clone__ssh_with_paths(void)
 	g_options.fetch_opts.callbacks.transport = git_transport_ssh_with_paths;
 	g_options.fetch_opts.callbacks.credentials = cred_cb;
 	g_options.fetch_opts.callbacks.payload = &arr;
+	g_options.fetch_opts.callbacks.certificate_check = NULL;
 
 	cl_git_fail(git_clone(&g_repo, _remote_url, "./foo", &g_options));
 
@@ -745,7 +764,7 @@ static int proxy_cert(git_cert *cert, int valid, const char *host, void *payload
 	else
 		host_len = strlen(_remote_proxy_host);
 
-	if (_remote_proxy_selfsigned &&
+	if (_remote_proxy_selfsigned != NULL &&
 	    strlen(host) == host_len &&
 	    strncmp(_remote_proxy_host, host, host_len) == 0)
 		valid = 1;
