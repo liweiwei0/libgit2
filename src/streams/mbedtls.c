@@ -18,10 +18,6 @@
 #include "git2/transport.h"
 #include "util.h"
 
-#ifdef GIT_CURL
-# include "streams/curl.h"
-#endif
-
 #ifndef GIT_DEFAULT_CERT_LOCATION
 #define GIT_DEFAULT_CERT_LOCATION NULL
 #endif
@@ -431,11 +427,7 @@ int git_mbedtls_stream_new(
 
 	assert(out && host);
 
-#ifdef GIT_CURL
-	error = git_curl_stream_new(&stream, host, port);
-#else
 	error = git_socket_stream_new(&stream, host, port);
-#endif
 
 	if (!error)
 		error = mbedtls_stream_wrap(out, stream, host, 1);
