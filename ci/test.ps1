@@ -40,8 +40,8 @@ Write-Host "####################################################################
 if (-not $Env:SKIP_PROXY_TESTS) {
 	Write-Host ""
 	Write-Host "Starting HTTP proxy..."
-	Invoke-WebRequest -Method GET -Uri https://github.com/ethomson/poxyproxy/releases/download/v0.1.0/poxyproxy-0.1.0.jar -OutFile poxyproxy.jar
-	javaw -jar poxyproxy.jar -d --port 8080 --credentials foo:bar
+	Invoke-WebRequest -Method GET -Uri https://github.com/ethomson/poxyproxy/releases/download/v0.3.0/poxyproxy-0.3.0.jar -OutFile poxyproxy.jar
+	javaw -jar poxyproxy.jar -d --address 127.0.0.1 --port 8080 --credentials foo:bar
 }
 
 Write-Host ""

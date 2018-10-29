@@ -79,8 +79,9 @@ fi
 
 if [ -z "$SKIP_PROXY_TESTS" ]; then
 	echo "Starting HTTP proxy..."
-	curl -L https://github.com/ethomson/poxyproxy/releases/download/v0.2.0/poxyproxy-0.2.0.jar >poxyproxy.jar
-	java -jar poxyproxy.jar -d --address 127.0.0.1 --port 8080 --credentials foo:bar >/dev/null 2>&1 &
+	curl -L https://github.com/ethomson/poxyproxy/releases/download/v0.3.0/poxyproxy-0.3.0.jar >poxyproxy.jar
+	java -jar poxyproxy.jar -d --address 127.0.0.1 --port 8080 --ssl-port 8081 --ssl-keystore "${SOURCE_DIR}/ci/proxy_keystore.jks" --ssl-keystore-password password --credentials foo:bar >/dev/null 2>&1 &
+	sleep 5
 fi
 
 if [ -z "$SKIP_SSH_TESTS" ]; then
@@ -168,9 +169,20 @@ if [ -z "$SKIP_PROXY_TESTS" ]; then
 	export GITTEST_REMOTE_PROXY_USER="foo"
 	export GITTEST_REMOTE_PROXY_PASS="bar"
 	run_test proxy
+
+	echo ""
+	echo "Running proxy (SSL) tests"
+	echo ""
+	export GITTEST_REMOTE_PROXY_SCHEME="https"
+	export GITTEST_REMOTE_PROXY_HOST="localhost:8081"
+	export GITTEST_REMOTE_PROXY_SELFSIGNED=1
+	run_test proxy
+
+	unset GITTEST_REMOTE_PROXY_SCHEME
 	unset GITTEST_REMOTE_PROXY_HOST
 	unset GITTEST_REMOTE_PROXY_USER
 	unset GITTEST_REMOTE_PROXY_PASS
+	unset GITTEST_REMOTE_PROXY_SELFSIGNED
 fi
 
 if [ -z "$SKIP_SSH_TESTS" ]; then
